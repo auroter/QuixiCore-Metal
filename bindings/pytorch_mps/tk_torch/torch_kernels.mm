@@ -1272,7 +1272,7 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_kv_cache_zero(e, key_cache, value_cache, total, tn);
     tk::launch_kv_cache_scatter(e, key, value, slot_mapping, key_cache, value_cache,
-                                T, H, D, static_cast<int>(block_size), tn);
+                                T, H, D, static_cast<int>(block_size), 1, tn);
   });
   return {key_cache, value_cache};
 }
@@ -1971,7 +1971,8 @@ static at::Tensor paged_attention_mps(
         0,
         no_mask,
         0,
-        static_cast<int>(window), 1, tn);
+        static_cast<int>(window), 1,
+        static_cast<uint64_t>(key_cache.stride(0)), tn);
   });
   return out;
 }
@@ -2031,7 +2032,8 @@ static at::Tensor paged_attention_block_sparse_mps(
         0,
         mask,
         1,
-        static_cast<int>(window), mask_heads, tn);
+        static_cast<int>(window), mask_heads,
+        static_cast<uint64_t>(key_cache.stride(0)), tn);
   });
   return out;
 }
@@ -2086,7 +2088,8 @@ static at::Tensor paged_attention_alibi_mps(
         1,
         no_mask,
         0,
-        static_cast<int>(window), 1, tn);
+        static_cast<int>(window), 1,
+        static_cast<uint64_t>(key_cache.stride(0)), tn);
   });
   return out;
 }
@@ -2996,7 +2999,8 @@ static std::tuple<at::Tensor, at::Tensor> gdn_recur_mps(
   auto y = at::empty_like(v);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_gdn_recur(e, q, k, v, g, beta, pool, cu, slots, y, R, Hk, Hv, Dv, Dk,
-                         load_initial ? 1 : 0, tk_type_name(q));
+                         load_initial ? 1 : 0, static_cast<int>(pool.stride(0)),
+                         tk_type_name(q));
   });
   return {y, pool};
 }
@@ -3029,7 +3033,8 @@ static std::tuple<at::Tensor, at::Tensor> gdn_short_conv_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_gdn_short_conv(
         e, x, weight, pool, cu, slots, out, R, channels, kernel_size,
-        load_initial ? 1 : 0, apply_silu ? 1 : 0, tk_type_name(x));
+        load_initial ? 1 : 0, apply_silu ? 1 : 0,
+        static_cast<int>(pool.stride(0)), kernel_size - 1, tk_type_name(x));
   });
   return {out, pool};
 }

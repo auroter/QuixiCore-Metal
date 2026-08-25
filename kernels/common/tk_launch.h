@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 #include "base_q_descriptor.h"
@@ -147,6 +148,15 @@ inline std::string gdn_gate_beta_kernel_name(const std::string& t) {
 }
 inline std::string gdn_gated_rmsnorm_kernel_name(const std::string& t, int D) {
   return "gdn_gated_rmsnorm_" + t + "_d" + std::to_string(D);
+}
+inline std::string gdn_fused_prepare_kernel_name(const std::string& t, int Dk,
+                                                 int Dv) {
+  return "gdn_fused_prepare_" + t + "_dk" + std::to_string(Dk) + "_dv" +
+         std::to_string(Dv);
+}
+inline std::string gdn_gated_rmsnorm_f32_kernel_name(const std::string& t,
+                                                     int D) {
+  return "gdn_gated_rmsnorm_f32_" + t + "_d" + std::to_string(D);
 }
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) {
   return "moe_grouped_gemm_rect_q_" + fmt;
@@ -302,6 +312,57 @@ inline std::string fftconv_kernel_name(int S) {
 }
 inline std::string qgemm_kernel_name(const std::string& fmt) {
   return "qgemm_" + fmt;
+}
+// variant: 4 = 4 warps x 16 rows, 2 = 2 warps x 16 rows, 8 = 2 warps x 8
+// rows, 9 = 2 warps x 8 rows with split-K 4 (float partials + reduce pass).
+// 21..27 are BENCH-ONLY stage ablations of the 4-warp paired kernel
+// (qgemm_sm_p4a1..a7): per-stage measurement, parity intentionally broken.
+inline std::string qgemm_sm_kernel_name(const std::string& fmt, int variant) {
+  if (variant >= 21 && variant <= 27) {
+    return "qgemm_sm_p4a" + std::to_string(variant - 20) + "_" + fmt;
+  }
+  if (variant >= 28 && variant <= 30) {
+    return "qgemm_sm_t2w8a" + std::to_string(variant - 27) + "_" + fmt;
+  }
+  if (variant == 31) {
+    return "qgemm_sm_t2w8s1_" + fmt;
+  }
+  return (variant == 17   ? "qgemm_sm_t4_"
+          : variant == 16 ? "qgemm_sm_t2w8_"
+          : variant == 15 ? "qgemm_sm_t2_"
+          : variant == 14 ? "qgemm_sm_t_"
+          : variant == 13 ? "qgemm_sm_p8_"
+          : variant == 12 ? "qgemm_sm_p4_"
+          : variant == 11 ? "qgemm_sm_p_"
+          : variant == 10 ? "qgemm_sm_bk64_"
+          : variant == 9  ? "qgemm_sm_r8sk4_"
+          : variant == 8  ? "qgemm_sm_r8_"
+          : variant == 2  ? "qgemm_sm_w2_"
+                          : "qgemm_sm_") +
+         fmt;
+}
+inline int qgemm_sm_tg_threads(int variant) {
+  if (variant == 12 || variant == 14 || variant == 15 || variant == 17)
+    return 128;
+  if (variant == 13 || variant == 16) return 256;
+  if (variant >= 28 && variant <= 31) return 256;
+  if (variant >= 21 && variant <= 27) return 128;
+  return (variant == 4 ? 4 : 2) * 32;
+}
+inline int qgemm_sm_tg_rows(int variant) {
+  if (variant == 12 || variant == 14 || variant == 15 || variant == 17)
+    return 32;
+  if (variant == 13 || variant == 16) return 64;
+  if (variant >= 28 && variant <= 31) return 64;
+  if (variant >= 21 && variant <= 27) return 32;
+  return (variant == 8 || variant == 9 || variant == 10 || variant == 11)
+             ? 16
+             : (variant == 2 ? 32 : 64);
+}
+inline int qgemm_sm_split_k(int variant) {
+  return ((variant >= 9 && variant <= 17) || (variant >= 21 && variant <= 30))
+             ? 4
+             : 1;
 }
 inline std::string qgemv_kernel_name(const std::string& fmt) {
   return "qgemv_" + fmt;
@@ -886,6 +947,60 @@ void launch_rms_norm_dyn(E& e, typename E::in_t x, typename E::in_t w,
   e.bytes(D, 5);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
+// Fused residual-add + dynamic-D RMSNorm: o = rms_norm(x + residual),
+// res_out = x + residual (rounded once). Bit-identical to the eager
+// add + rms_norm_dyn chain.
+template <class E>
+void launch_rms_norm_add_dyn(E& e, typename E::in_t x,
+                             typename E::in_t residual, typename E::in_t w,
+                             typename E::out_t o, typename E::out_t res_out,
+                             uint32_t M, int D, float eps) {
+  e.pipeline("mittens::rms_norm_add_dyn");
+  e.in(x, 0);
+  e.in(residual, 1);
+  e.in(w, 2);
+  e.out(o, 3);
+  e.out(res_out, 4);
+  e.bytes(M, 5);
+  e.bytes(eps, 6);
+  e.bytes(D, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+// Gemma-semantics dynamic-D RMSNorm: o = bf16((x32 * rrms) * (float(w) + 1)),
+// fp32 weight multiply, single final round (ir.ops.rms_norm with w32 + 1).
+template <class E>
+void launch_gemma_rms_norm_dyn(E& e, typename E::in_t x, typename E::in_t w,
+                               typename E::out_t o, uint32_t M, int D,
+                               float eps) {
+  e.pipeline("mittens::gemma_rms_norm_dyn");
+  e.in(x, 0);
+  e.in(w, 1);
+  e.out(o, 2);
+  e.bytes(M, 3);
+  e.bytes(eps, 4);
+  e.bytes(D, 5);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+// Gemma-semantics fused add + dynamic-D RMSNorm: statistic and normed value
+// from the UNROUNDED fp32 sum, res_out rounded once (ir.ops.fused_add_rms_norm
+// with w32 + 1).
+template <class E>
+void launch_gemma_rms_norm_add_dyn(E& e, typename E::in_t x,
+                                   typename E::in_t residual,
+                                   typename E::in_t w, typename E::out_t o,
+                                   typename E::out_t res_out, uint32_t M,
+                                   int D, float eps) {
+  e.pipeline("mittens::gemma_rms_norm_add_dyn");
+  e.in(x, 0);
+  e.in(residual, 1);
+  e.in(w, 2);
+  e.out(o, 3);
+  e.out(res_out, 4);
+  e.bytes(M, 5);
+  e.bytes(eps, 6);
+  e.bytes(D, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
 template <class E>
 void launch_rms_norm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w,
                             typename E::in_t dy, typename E::in_t rstd,
@@ -1269,9 +1384,10 @@ void launch_moe_grouped_gemm_bwd_dw(Enc& e, typename Enc::out_t dw,
 
 // ----- gdn_recur (GatedDeltaNet): q@0 k@1 v@2 g@3 beta@4 state_pool@5(f32)
 // cu_seqlens@6(i32)
-//        slot_mapping@7(i32) -> y@8 ; R@9 Hk@10 Hv@11 Dv@12 load_initial@13 ;
-//        grid (Dv, 1, R*Hv), 32 thr (lanes partition Dk; Dk in {64,128} via
-//        kernel name). -----
+//        slot_mapping@7(i32) -> y@8 ; R@9 Hk@10 Hv@11 Dv@12 load_initial@13
+//        state_stride@14 (floats between slot rows; rows (Hv,Dv,Dk)
+//        contiguous) ; grid (Dv, 1, R*Hv), 32 thr (lanes partition Dk; Dk in
+//        {64,128} via kernel name). -----
 template <class E>
 void launch_gdn_recur(E& e, typename E::in_t q, typename E::in_t k,
                       typename E::in_t v, typename E::in_t g,
@@ -1279,7 +1395,7 @@ void launch_gdn_recur(E& e, typename E::in_t q, typename E::in_t k,
                       typename E::in_t cu_seqlens,
                       typename E::in_t slot_mapping, typename E::out_t y, int R,
                       int Hk, int Hv, int Dv, int Dk, int load_initial,
-                      const std::string& type_name) {
+                      int state_stride, const std::string& type_name) {
   e.pipeline(gdn_recur_kernel_name(type_name, Dk));
   e.in(q, 0);
   e.in(k, 1);
@@ -1295,6 +1411,7 @@ void launch_gdn_recur(E& e, typename E::in_t q, typename E::in_t k,
   e.bytes(Hv, 11);
   e.bytes(Dv, 12);
   e.bytes(load_initial, 13);
+  e.bytes(state_stride, 14);
   e.dispatch(Dv, 1, R * Hv, 32, 1, 1);
 }
 
@@ -1309,8 +1426,8 @@ void launch_gdn_short_conv(E& e, typename E::in_t x, typename E::in_t weight,
                            typename E::in_t cu_seqlens,
                            typename E::in_t slot_mapping, typename E::out_t out,
                            int R, int channels, int kernel_size,
-                           int load_initial, int apply_silu,
-                           const std::string& type_name) {
+                           int load_initial, int apply_silu, int state_stride,
+                           int state_cols, const std::string& type_name) {
   e.pipeline(gdn_short_conv_kernel_name(type_name));
   e.in(x, 0);
   e.in(weight, 1);
@@ -1323,6 +1440,8 @@ void launch_gdn_short_conv(E& e, typename E::in_t x, typename E::in_t weight,
   e.bytes(kernel_size, 8);
   e.bytes(load_initial, 9);
   e.bytes(apply_silu, 10);
+  e.bytes(state_stride, 11);
+  e.bytes(state_cols, 12);
   constexpr int threads = 256;
   e.dispatch((channels + threads - 1) / threads, R, 1, threads, 1, 1);
 }
@@ -1378,6 +1497,113 @@ void launch_gdn_gated_rmsnorm(E& e, typename E::in_t y, typename E::in_t z,
   e.out(out, 3);
   e.bytes(rows, 4);
   e.bytes(eps, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- gdn_fused_prepare: conv+silu, q/k norm, v, decay/beta in one dispatch.
+//        qkvz@0 ba@1 (activation dtype, explicit element row strides)
+//        conv_w@2(f32 [channels, ksize]) conv_state_pool@3(f32) cu_seqlens@4
+//        slot_mapping@5 A_log@6 dt_bias@7 -> q@8 k@9 v@10 decay@11 beta@12
+//        (all f32) ; R@13 Hk@14 Hv@15 ksize@16 load_initial@17 qkvz_stride@18
+//        ba_stride@19 conv_state_stride@20 eps@21 q_scale@22 k_scale@23 ;
+//        grid (R*(2Hk+Hv+1), 1, 1), 32 thr (one simdgroup per logical row;
+//        Dk/Dv in {64,128} via kernel name). -----
+template <class E>
+void launch_gdn_fused_prepare(
+    E& e, typename E::in_t qkvz, typename E::in_t ba, typename E::in_t conv_w,
+    typename E::out_t conv_state_pool, typename E::in_t cu_seqlens,
+    typename E::in_t slot_mapping, typename E::in_t A_log,
+    typename E::in_t dt_bias, typename E::out_t q, typename E::out_t k,
+    typename E::out_t v, typename E::out_t decay, typename E::out_t beta,
+    int R, int Hk, int Hv, int Dk, int Dv, int kernel_size, int load_initial,
+    int qkvz_stride, int ba_stride, int conv_state_stride, float eps,
+    float q_scale, float k_scale, int state_cols,
+    typename E::in_t num_accepted, int spec_mode,
+    const std::string& type_name) {
+  e.pipeline(gdn_fused_prepare_kernel_name(type_name, Dk, Dv));
+  e.in(qkvz, 0);
+  e.in(ba, 1);
+  e.in(conv_w, 2);
+  e.out(conv_state_pool, 3);
+  e.in(cu_seqlens, 4);
+  e.in(slot_mapping, 5);
+  e.in(A_log, 6);
+  e.in(dt_bias, 7);
+  e.out(q, 8);
+  e.out(k, 9);
+  e.out(v, 10);
+  e.out(decay, 11);
+  e.out(beta, 12);
+  e.bytes(R, 13);
+  e.bytes(Hk, 14);
+  e.bytes(Hv, 15);
+  e.bytes(kernel_size, 16);
+  e.bytes(load_initial, 17);
+  e.bytes(qkvz_stride, 18);
+  e.bytes(ba_stride, 19);
+  e.bytes(conv_state_stride, 20);
+  e.bytes(eps, 21);
+  e.bytes(q_scale, 22);
+  e.bytes(k_scale, 23);
+  e.bytes(state_cols, 24);
+  e.in(num_accepted, 25);
+  e.bytes(spec_mode, 26);
+  e.dispatch(R * (2 * Hk + Hv + 1), 1, 1, 32, 1, 1);
+}
+
+// ----- gdn_recur_spec: gdn_recur with per-request slot rows. slot_table@7
+//        is int32 [R, S] with row stride table_stride@15; the initial state
+//        loads from slot_table[r, num_accepted[r]-1] and the state after
+//        every timestep t is checkpointed to slot_table[r, t]. -----
+template <class E>
+void launch_gdn_recur_spec(E& e, typename E::in_t q, typename E::in_t k,
+                           typename E::in_t v, typename E::in_t g,
+                           typename E::in_t beta, typename E::out_t state_pool,
+                           typename E::in_t cu_seqlens,
+                           typename E::in_t slot_table,
+                           typename E::in_t num_accepted, typename E::out_t y,
+                           int R, int Hk, int Hv, int Dv, int Dk,
+                           int state_stride, int table_stride,
+                           const std::string& type_name) {
+  e.pipeline("gdn_recur_spec_" + type_name + "_d" + std::to_string(Dk));
+  e.in(q, 0);
+  e.in(k, 1);
+  e.in(v, 2);
+  e.in(g, 3);
+  e.in(beta, 4);
+  e.out(state_pool, 5);
+  e.in(cu_seqlens, 6);
+  e.in(slot_table, 7);
+  e.in(num_accepted, 8);
+  e.out(y, 9);
+  e.bytes(R, 10);
+  e.bytes(Hk, 11);
+  e.bytes(Hv, 12);
+  e.bytes(Dv, 13);
+  e.bytes(state_stride, 14);
+  e.bytes(table_stride, 15);
+  e.dispatch(Dv, 1, R * Hv, 32, 1, 1);
+}
+
+// ----- gdn_gated_rmsnorm_f32: y@0 (f32 [rows, D], rounded to the activation
+//        dtype in-register) z@1 (activation dtype, read in place with token
+//        stride z_stride@6, head stride D) weight@2 -> out@3 ; rows@4 Hv@5
+//        eps@7 ; grid (rows, 1, 1), 32 thr. -----
+template <class E>
+void launch_gdn_gated_rmsnorm_f32(E& e, typename E::in_t y,
+                                  typename E::in_t z, typename E::in_t weight,
+                                  typename E::out_t out, int rows, int Hv,
+                                  int dim, int z_stride, float eps,
+                                  const std::string& type_name) {
+  e.pipeline(gdn_gated_rmsnorm_f32_kernel_name(type_name, dim));
+  e.in(y, 0);
+  e.in(z, 1);
+  e.in(weight, 2);
+  e.out(out, 3);
+  e.bytes(rows, 4);
+  e.bytes(Hv, 5);
+  e.bytes(z_stride, 6);
+  e.bytes(eps, 7);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
@@ -2936,10 +3162,11 @@ void launch_mla_q_norm_rope(E& e, typename E::in_t q, typename E::in_t cos,
                             int norm_mode, float eps, int head_dim,
                             bool half_input = false) {
   // half_input selects the fp16-load variant (rounds to bf16 in-register;
-  // only instantiated for head_dim 512 — the DSV4 serving shape).
-  e.pipeline(half_input
-                 ? "mla_q_norm_rope_half_" + std::to_string(head_dim)
-                 : mla_q_norm_rope_kernel_name(head_dim));
+  // only instantiated for head_dim 512 — the DSV4 serving shape). Contract:
+  // half_input requires head_dim == 512 or the pipeline lookup fails; the
+  // sole caller passes the literal 512 and TORCH_CHECK-gates q's last dim.
+  e.pipeline(half_input ? "mla_q_norm_rope_half_" + std::to_string(head_dim)
+                        : mla_q_norm_rope_kernel_name(head_dim));
   e.in(q, 0);
   e.in(cos, 1);
   e.in(sin, 2);
@@ -3076,9 +3303,9 @@ void launch_dsv4_indexer_compress_insert(
     typename E::in_t state_slots, typename E::in_t token_to_req,
     typename E::in_t block_table, typename E::in_t rms_w,
     typename E::in_t kv_slots, typename E::out_t kv_cache, int num_tokens,
-    int state_block_size, int state_stride0, int state_stride1,
-    int state_width, int compress_ratio, int bt_stride, int bt_cols,
-    int kv_block_size, int kv_block_stride, float eps) {
+    int state_block_size, int state_stride0, int state_stride1, int state_width,
+    int compress_ratio, int bt_stride, int bt_cols, int kv_block_size,
+    int kv_block_stride, float eps) {
   e.pipeline("dsv4_indexer_compress_insert");
   e.in(state_cache, 0);
   e.in(cos, 1);
@@ -3111,16 +3338,13 @@ void launch_dsv4_indexer_compress_insert(
 // holds its 2*ratio-row history in fixed-size stack arrays (sized for
 // ratio 4); any other ratio must not route to it.
 template <class E>
-void launch_dsv4_compress_front(E& e, typename E::in_t state_cache,
-                                typename E::in_t positions,
-                                typename E::in_t state_slots,
-                                typename E::in_t token_to_req,
-                                typename E::in_t block_table,
-                                typename E::in_t rms_w, typename E::out_t out,
-                                int tokens, int state_block_size,
-                                int state_stride0, int state_stride1,
-                                int state_width, int compress_ratio,
-                                int bt_stride, int bt_cols, float eps) {
+void launch_dsv4_compress_front(
+    E& e, typename E::in_t state_cache, typename E::in_t positions,
+    typename E::in_t state_slots, typename E::in_t token_to_req,
+    typename E::in_t block_table, typename E::in_t rms_w, typename E::out_t out,
+    int tokens, int state_block_size, int state_stride0, int state_stride1,
+    int state_width, int compress_ratio, int bt_stride, int bt_cols,
+    float eps) {
   const bool c128 = compress_ratio == 128;
   e.pipeline(c128 ? "dsv4_compress_front_c128" : "dsv4_compress_front");
   e.in(state_cache, 0);
@@ -3341,6 +3565,11 @@ void launch_mla_decode_fp8_sparse_two_cache_packed(
 // group instead of once per head. Outputs bit-identical to the fused
 // decode kernel above.
 template <class E>
+// Contract: num_heads % 16 == 0 (the kernel hard-wires 16 heads per
+// 256-thread threadgroup and the grid below truncates num_heads / 16).
+// The sole caller in qc_metal_serving.mm gates on batch >= 64 &&
+// heads % 16 == 0; non-conforming shapes fall through to the fused
+// decode-kernel walk below that branch.
 void launch_mla_prefill_fp8_sparse_two_cache_packed(
     E& e, typename E::in_t q, typename E::in_t compressed,
     typename E::in_t compressed_idx, typename E::in_t compressed_len,
@@ -3429,10 +3658,10 @@ void launch_mla_decode_fp8_sparse_two_cache_packed_partition(
     typename E::in_t compressed_idx, typename E::in_t compressed_len,
     typename E::in_t swa, typename E::in_t swa_idx, typename E::in_t swa_len,
     typename E::out_t tmp_out, typename E::out_t max_logits,
-    typename E::out_t exp_sums, int batch, int num_heads,
-    int compressed_width, int swa_width, int compressed_block_size,
-    int compressed_block_stride, int swa_block_size, int swa_block_stride,
-    float scale, int num_partitions, int partition_size) {
+    typename E::out_t exp_sums, int batch, int num_heads, int compressed_width,
+    int swa_width, int compressed_block_size, int compressed_block_stride,
+    int swa_block_size, int swa_block_stride, float scale, int num_partitions,
+    int partition_size) {
   e.pipeline("mla_decode_fp8_sparse_two_cache_packed_partition");
   e.in(q, 0);
   e.in(compressed, 1);
@@ -3982,7 +4211,7 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
                              typename E::out_t key_cache,
                              typename E::out_t value_cache, int num_tokens,
                              int num_heads, int head_size, int block_size,
-                             const std::string& type_name) {
+                             int block_mult, const std::string& type_name) {
   e.pipeline(kv_cache_kernel_name("scatter", type_name));
   e.in(key, 0);
   e.in(value, 1);
@@ -3992,6 +4221,7 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
   e.bytes(num_heads, 5);
   e.bytes(head_size, 6);
   e.bytes(block_size, 7);
+  e.bytes(block_mult, 8);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
@@ -4017,6 +4247,31 @@ void launch_kv_cache_gather(
   e.bytes(block_table_stride, 9);
   e.bytes(num_heads, 10);
   e.bytes(head_size, 11);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+// ----- Hybrid-safe range gather. Cache block stride is explicit and 64-bit,
+// so interleaved K/V pages beyond 2^31 elements remain addressable. -----
+template <class E>
+void launch_kv_cache_gather_range(
+    E& e, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::out_t key_out, typename E::out_t value_out,
+    typename E::in_t block_table, int token_start, int num_tokens,
+    int num_blocks, int block_size, int num_heads, int head_size,
+    int64_t cache_block_stride, const std::string& type_name) {
+  e.pipeline("kv_cache_gather_range_" + type_name);
+  e.in(key_cache, 0);
+  e.in(value_cache, 1);
+  e.out(key_out, 2);
+  e.out(value_out, 3);
+  e.in(block_table, 4);
+  e.bytes(token_start, 5);
+  e.bytes(num_tokens, 6);
+  e.bytes(num_blocks, 7);
+  e.bytes(block_size, 8);
+  e.bytes(num_heads, 9);
+  e.bytes(head_size, 10);
+  e.bytes(cache_block_stride, 11);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
@@ -4182,7 +4437,7 @@ void launch_paged_attention(
     int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, typename E::in_t alibi_slopes,
     int use_alibi, typename E::in_t block_mask, int use_mask, int window,
-    int mask_heads, const std::string& type_name) {
+    int mask_heads, uint64_t kv_block_stride, const std::string& type_name) {
   e.pipeline(paged_attention_kernel_name(type_name, head_size));
   e.in(q, 0);
   e.in(key_cache, 1);
@@ -4201,6 +4456,7 @@ void launch_paged_attention(
   e.bytes(use_mask, 14);
   e.bytes(window, 15);
   e.bytes(mask_heads, 16);
+  e.bytes(kv_block_stride, 17);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
@@ -4495,6 +4751,40 @@ void launch_paged_attention_partition(
   e.bytes(window, 15);
   e.bytes(softcap, 16);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+
+// Multi-query verify partition: the m expanded rows cooperate per (head,
+// partition) threadgroup, staging each K/V tile once. Partial layout matches
+// paged_attention_partition with batch == m, so the same reduce merges.
+template <class E>
+void launch_paged_attention_verify(
+    E& e, typename E::in_t q, typename E::in_t key_cache,
+    typename E::in_t value_cache, typename E::in_t block_table,
+    typename E::in_t context_lens, typename E::out_t tmp_out,
+    typename E::out_t max_logits, typename E::out_t exp_sums, int m_rows,
+    int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int num_partitions, int partition_size,
+    int window, const std::string& type_name) {
+  e.pipeline("paged_attention_verify_" + type_name + "_" +
+             std::to_string(head_size));
+  e.in(q, 0);
+  e.in(key_cache, 1);
+  e.in(value_cache, 2);
+  e.in(block_table, 3);
+  e.in(context_lens, 4);
+  e.out(tmp_out, 5);
+  e.out(max_logits, 6);
+  e.out(exp_sums, 7);
+  e.bytes(block_size, 8);
+  e.bytes(block_table_stride, 9);
+  e.bytes(scale, 10);
+  e.bytes(num_heads, 11);
+  e.bytes(num_kv_heads, 12);
+  e.bytes(num_partitions, 13);
+  e.bytes(partition_size, 14);
+  e.bytes(window, 15);
+  e.bytes(m_rows, 16);
+  e.dispatch(num_heads, 1, num_partitions, m_rows * 32, 1, 1);
 }
 
 // Cascade prefix partition: a shared CONTIGUOUS prefix KV (prefix_k/prefix_v
@@ -5713,6 +6003,148 @@ void launch_qgemm_wide_t(E& e, typename E::out_t dt, typename E::in_t wq,
   e.dispatch(M / 64, N / 64, 1, 64, 1, 1);
 }
 
+// ----- qgemm_sm: small-M weight-streaming MMA GEMM. D@0 (N,32 half) Wq@1
+//        X@2 (K,32 half, host-padded) ; N@3 K@4 ; grid (1, N/tg_rows, 1),
+//        tg_threads threads. Every warp computes all 32 columns for its own
+//        row slice. -----
+template <class E>
+void launch_qgemm_sm(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int variant,
+                     const std::string& fmt) {
+  e.pipeline(qgemm_sm_kernel_name(fmt, variant));
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.dispatch(1, N / qgemm_sm_tg_rows(variant), qgemm_sm_split_k(variant),
+             qgemm_sm_tg_threads(variant), 1, 1);
+}
+
+// ----- qgemm_sm_rm: row-major bf16 X variant for the fused verify step.
+//        P@0 (4,N,32 float partials) Wq@1 X@2 (M,K bf16) ; N@3 K@4 M@5 ;
+//        grid (1, N/16, 4), 64 threads. Fold with qgemm_sm_reduce_rm. -----
+template <class E>
+void launch_qgemm_sm_rm(E& e, typename E::out_t p, typename E::in_t wq,
+                        typename E::in_t x, int N, int K, int M,
+                        const std::string& fmt) {
+  e.pipeline("qgemm_sm_rm_" + fmt);
+  e.out(p, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.bytes(M, 5);
+  e.dispatch(1, N / 16, 4, 64, 1, 1);
+}
+
+// ----- muse_xpose32: (m,K) bf16 -> (K,32) half transpose+pad. out@0 x@1 ;
+//        K@2 m@3 ; grid ceil(K*32/256), 256 threads. -----
+template <class E>
+void launch_muse_xpose32(E& e, typename E::out_t out, typename E::in_t x, int K,
+                         int m) {
+  e.pipeline("mittens::muse_xpose32");
+  e.out(out, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.bytes(m, 3);
+  e.dispatch((K * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- qgemm_sm_reduce_rm: fold rm partials into bf16 (M,N). D@0 P@1 ;
+//        N@2 M@3 ; grid ceil(M*N/256), 256 threads. -----
+// uint4-native q4_K route: xsum precomputes per-group X column sums (the
+// rank-1 min-term), then one dispatch covers the whole GEMM.
+template <class E>
+void launch_qgemm_sm_u4_xsum(E& e, typename E::out_t xs, typename E::in_t x,
+                             int K) {
+  e.pipeline("mittens::qgemm_sm_u4_xsum");
+  e.out(xs, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.dispatch((K / 32 * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_u4(E& e, typename E::out_t p, typename E::in_t wu,
+                        typename E::in_t x, typename E::in_t sc,
+                        typename E::in_t mn, typename E::in_t xs, int N,
+                        int K) {
+  e.pipeline("mittens::qgemm_sm_u4");
+  e.out(p, 0);
+  e.in(wu, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.in(mn, 4);
+  e.in(xs, 5);
+  e.bytes(N, 6);
+  e.bytes(K, 7);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+// glue-free u4: (M, K) bf16 X straight in, reduce_rm emits (M, N) bf16
+template <class E>
+void launch_qgemm_sm_u4b_xsum(E& e, typename E::out_t xs, typename E::in_t x,
+                              int K, int M) {
+  e.pipeline("mittens::qgemm_sm_u4b_xsum");
+  e.out(xs, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.bytes(M, 3);
+  e.dispatch((K / 32 * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_u4b(E& e, typename E::out_t p, typename E::in_t wu,
+                         typename E::in_t x, typename E::in_t sc,
+                         typename E::in_t mn, typename E::in_t xs, int N, int K,
+                         int M) {
+  e.pipeline("mittens::qgemm_sm_u4b");
+  e.out(p, 0);
+  e.in(wu, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.in(mn, 4);
+  e.in(xs, 5);
+  e.bytes(N, 6);
+  e.bytes(K, 7);
+  e.bytes(M, 8);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+// int8-native q6_K route (no min-term; -32 folded into the repack)
+template <class E>
+void launch_qgemm_sm_u8(E& e, typename E::out_t p, typename E::in_t wq8,
+                        typename E::in_t x, typename E::in_t sc, int N, int K) {
+  e.pipeline("mittens::qgemm_sm_u8");
+  e.out(p, 0);
+  e.in(wq8, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_reduce_rm(E& e, typename E::out_t d, typename E::in_t p,
+                               int N, int M) {
+  e.pipeline("mittens::qgemm_sm_reduce_rm");
+  e.out(d, 0);
+  e.in(p, 1);
+  e.bytes(N, 2);
+  e.bytes(M, 3);
+  e.dispatch((M * N + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- qgemm_sm_reduce: fold split-K float partials (SK,N,32) into half
+//        (N,32). D@0 P@1 ; N@2 SK@3 ; grid ceil(N*32/256), 256 threads. -----
+template <class E>
+void launch_qgemm_sm_reduce(E& e, typename E::out_t d, typename E::in_t p,
+                            int N, int split_k) {
+  e.pipeline("mittens::qgemm_sm_reduce");
+  e.out(d, 0);
+  e.in(p, 1);
+  e.bytes(N, 2);
+  e.bytes(split_k, 3);
+  e.dispatch((N * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
 // ----- qgemm_actorder: GPTQ act-order, in-kernel g_idx gather. D@0 Wq@1 X@2
 // perm@3(int) ; N@4 K@5
 //        M@6 ; grid (M/32, N/32, 1), 32 threads. Gathers X K-rows by perm
@@ -6013,6 +6445,30 @@ template <class E>
 void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq,
                   typename E::in_t x, int N, int K, const std::string& fmt,
                   const std::string& type_name = "float16") {
+  // q4_K rides the llama.cpp-layout multi-row kernel (qgemv_q4k_nr): the
+  // one-row walk's BPI=1 for 256-wide blocks measured 180-290 GB/s at the
+  // Qwen3.8 MLP shapes vs ~500+ for q8_0. Different summation order than
+  // qgemv<q4_K> (fp32 factored-scale accumulate, no per-element half
+  // rounding). N/K divisibility guards the kernel's unpadded tail reads;
+  // VLLM_QC_Q4K_NR=0 is the kill switch back to the row-walk kernel.
+  static const bool q4k_nr_off = [] {
+    const char* v = std::getenv("VLLM_QC_Q4K_NR");
+    return v != nullptr && v[0] == '0' && v[1] == '\0';
+  }();
+  if (fmt == "q4_K" && !q4k_nr_off && N % 4 == 0 && K % 256 == 0 &&
+      type_name != "float32") {
+    e.pipeline(type_name == "bfloat16" ? "qgemv_q4_K_nr_bfloat16"
+                                       : "qgemv_q4_K_nr");
+    e.out(d, 0);
+    e.in(wq, 1);
+    e.in(x, 2);
+    e.bytes(N, 3);
+    e.bytes(K, 4);
+    // 2 simdgroups x 2 rows per threadgroup.
+    e.dispatch(N / 4, 1, 1, 64, 1, 1);
+    return;
+  }
+
   const bool use_small = K <= 512 && (fmt == "q8_0" || fmt == "q4_0");
   if (type_name == "float32") {
     e.pipeline(qgemv_kernel_name(fmt) + "_float32");
@@ -6046,6 +6502,180 @@ void launch_qgemv_mb(E& e, typename E::out_t d, typename E::in_t wq,
                      const std::string& fmt, const std::string& type_name) {
   std::string name = qgemv_kernel_name(fmt) + "_mb" + std::to_string(M);
   if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// Compressed-tensors FP8-per-channel W8A16 GEMV: planar row-major e4m3 bytes
+// (N, K) with a separate per-row float scale buffer (see qgemv_fp8ch).
+// Geometry matches qgemv_q4k_nr: 2 simdgroups x 2 rows per threadgroup.
+// Caller guards: N % 4 == 0, K % 16 == 0, contiguous inputs.
+template <class E>
+void launch_qgemv_fp8ch(E& e, typename E::out_t d, typename E::in_t wq,
+                        typename E::in_t x, typename E::in_t w_scale,
+                        int N, int K, const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_fp8ch_bfloat16" : "qgemv_fp8ch");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.dispatch(N / 4, 1, 1, 64, 1, 1);
+}
+
+// Column-pair batch twin of launch_qgemv_fp8ch: D (M, N) and X (M, K)
+// contiguous row-major, grid.y = M/2 column pairs, weights decoded once
+// per pair. Caller guards: batch-1's plus M even.
+template <class E>
+void launch_qgemv_fp8ch_mb(E& e, typename E::out_t d, typename E::in_t wq,
+                           typename E::in_t x, typename E::in_t w_scale,
+                           int N, int K, int M,
+                           const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_fp8ch_mb_bfloat16"
+                                     : "qgemv_fp8ch_mb");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.dispatch(N / 4, M / 2, 1, 64, 1, 1);
+}
+
+// Compressed-tensors NVFP4 W4A16 GEMV over the planar checkpoint layout:
+// packed e2m1 pairs (N, K/2) + raw e4m3 group scales (N, K/16) + fp32
+// global multiplier (1,). Same geometry as launch_qgemv_fp8ch.
+// Caller guards: N % 4 == 0, K % 16 == 0, contiguous inputs.
+template <class E>
+void launch_qgemv_nvfp4_planar(E& e, typename E::out_t d, typename E::in_t wq,
+                               typename E::in_t x, typename E::in_t w_scale,
+                               typename E::in_t global_scale, int N, int K,
+                               const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_nvfp4_planar_bfloat16"
+                                     : "qgemv_nvfp4_planar");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.in(global_scale, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.dispatch(N / 4, 1, 1, 64, 1, 1);
+}
+
+// Column-pair batch twin of launch_qgemv_nvfp4_planar: D (M, N) and
+// X (M, K) contiguous row-major, grid.y = M/2 column pairs, nibbles and
+// group scales decoded once per pair. Caller guards: batch-1's plus
+// M even.
+template <class E>
+void launch_qgemv_nvfp4_planar_mb(E& e, typename E::out_t d,
+                                  typename E::in_t wq, typename E::in_t x,
+                                  typename E::in_t w_scale,
+                                  typename E::in_t global_scale, int N, int K,
+                                  int M, const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_nvfp4_planar_mb_bfloat16"
+                                     : "qgemv_nvfp4_planar_mb");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.in(global_scale, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.dispatch(N / 4, M / 2, 1, 64, 1, 1);
+}
+
+// mv_ext batch twin of launch_qgemv_fp8ch: NR=4 rows per simdgroup x R1=4
+// columns per pass, weights re-read ceil(M/4) times, any M >= 1 (pad
+// columns store-guarded in the kernel). Caller guards: batch-1's plus
+// N % 8 == 0 and contiguous row-major X (M, K) / D (M, N).
+template <class E>
+void launch_qgemv_fp8ch_mv4r(E& e, typename E::out_t d, typename E::in_t wq,
+                             typename E::in_t x, typename E::in_t w_scale,
+                             int N, int K, int M,
+                             const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_fp8ch_mv4r_bfloat16"
+                                     : "qgemv_fp8ch_mv4r");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.bytes(M, 6);
+  e.dispatch(N / 8, (M + 3) / 4, 1, 64, 1, 1);
+}
+
+// mv_ext batch twin of launch_qgemv_nvfp4_planar: NR=4 rows x R1=2
+// columns per pass (R1=2 measured best for this format), weights re-read
+// ceil(M/2) times, any M >= 1. Caller guards: batch-1's plus N % 8 == 0
+// and contiguous row-major X (M, K) / D (M, N).
+template <class E>
+void launch_qgemv_nvfp4_mv4r(E& e, typename E::out_t d, typename E::in_t wq,
+                             typename E::in_t x, typename E::in_t w_scale,
+                             typename E::in_t global_scale, int N, int K,
+                             int M, const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemv_nvfp4_mv4r_bfloat16"
+                                     : "qgemv_nvfp4_mv4r");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.in(global_scale, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.bytes(M, 7);
+  e.dispatch(N / 8, (M + 1) / 2, 1, 64, 1, 1);
+}
+
+// Weight-stationary multi-row GEMV over M activation rows. M must be one of
+// the instantiated row counts (2/4/8/16/17/32); hosts decompose other
+// batches. Reads the quantized weights once for the whole row block.
+template <class E>
+void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int m_rows,
+                     const std::string& fmt,
+                     const std::string& type_name = "float16") {
+  // q4_K 2/4/8-row chunks ride the NR-layout batch twin (qgemv_q4k_nr_mb):
+  // the generic walk below has BPI=1 for 256-wide blocks and measured 91/81
+  // GB/s at the M=8 MLP shapes. Per-row outputs are bit-identical to the
+  // looped batch-1 qgemv_q4k_nr, NOT to qgemv_mm<q4_K>. Same tail-read
+  // guards as the batch-1 route. VLLM_QC_Q4K_NR=0 kills every NR route;
+  // VLLM_QC_Q4K_NR_MM=0 kills only this batch route (bisection).
+  static const bool q4k_nr_off = [] {
+    const char* v = std::getenv("VLLM_QC_Q4K_NR");
+    return v != nullptr && v[0] == '0' && v[1] == '\0';
+  }();
+  static const bool q4k_nr_mm_off = [] {
+    const char* v = std::getenv("VLLM_QC_Q4K_NR_MM");
+    return v != nullptr && v[0] == '0' && v[1] == '\0';
+  }();
+  if (fmt == "q4_K" && !q4k_nr_off && !q4k_nr_mm_off &&
+      (m_rows == 2 || m_rows == 4 || m_rows == 8) && N % 4 == 0 &&
+      K % 256 == 0 && type_name != "float32") {
+    e.pipeline(type_name == "bfloat16" ? "qgemv_mm_q4_K_nr_bfloat16"
+                                       : "qgemv_mm_q4_K_nr");
+    e.out(d, 0);
+    e.in(wq, 1);
+    e.in(x, 2);
+    e.bytes(N, 3);
+    e.bytes(K, 4);
+    // 2 simdgroups x 2 rows per threadgroup; grid.y indexes column pairs.
+    e.dispatch(N / 4, m_rows / 2, 1, 64, 1, 1);
+    return;
+  }
+
+  std::string name = "qgemv_mm_" + fmt;
+  if (type_name == "bfloat16") {
+    name += "_bfloat16";
+  }
+  name += "_" + std::to_string(m_rows);
   e.pipeline(name);
   e.out(d, 0);
   e.in(wq, 1);
@@ -6134,17 +6764,76 @@ void launch_qc_swiglu(E& e, typename E::in_t x, typename E::out_t y, int n_out,
   e.dispatch((total + 255) / 256, 1, 1, 256, 1, 1);
 }
 
+// Fused Qwen3-Next attention prep: gated-q split + gemma QK-RMSNorm +
+// partial NeoX RoPE + gate de-interleave. One threadgroup (256 threads)
+// per (head, token); q_out/gate_out/k_out contiguous. positions index
+// dtype selects the _i64/_i32 instantiation.
+template <class E>
+void launch_qk_norm_rope_gate(E& e, typename E::in_t qkv,
+                              typename E::in_t q_w, typename E::in_t k_w,
+                              typename E::in_t cos_sin,
+                              typename E::in_t positions,
+                              typename E::out_t q_out,
+                              typename E::out_t gate_out,
+                              typename E::out_t k_out, int num_q_heads,
+                              int num_k_heads, int head_dim, int rot_dim,
+                              float eps, int qkv_row, int tokens,
+                              const std::string& type_name,
+                              const std::string& idx_name) {
+  e.pipeline("qc_qk_norm_rope_gate_" + type_name + "_" + idx_name);
+  e.in(qkv, 0);
+  e.in(q_w, 1);
+  e.in(k_w, 2);
+  e.in(cos_sin, 3);
+  e.in(positions, 4);
+  e.out(q_out, 5);
+  e.out(gate_out, 6);
+  e.out(k_out, 7);
+  e.bytes(num_q_heads, 8);
+  e.bytes(num_k_heads, 9);
+  e.bytes(head_dim, 10);
+  e.bytes(rot_dim, 11);
+  e.bytes(eps, 12);
+  e.bytes(qkv_row, 13);
+  e.dispatch(num_q_heads + num_k_heads, tokens, 1, 256, 1, 1);
+}
+
+// Fused DFlash2 grouped dynamic conv (drafter block conv): one dispatch
+// replacing the eager pad/mask/mul chain. delta rows are [taps, G] at a
+// caller-supplied row stride so the [T, 2, taps, G] projection's side
+// slices pass without a contiguous copy.
+template <class E>
+void launch_qc_dflash_conv(E& e, typename E::in_t x, typename E::in_t delta,
+                           typename E::in_t base, typename E::out_t out,
+                           int H, int num_groups, int group_size, int taps,
+                           int block_size, int delta_row_stride, int total,
+                           const std::string& type_name) {
+  e.pipeline("qc_dflash_conv_" + type_name);
+  e.in(x, 0);
+  e.in(delta, 1);
+  e.in(base, 2);
+  e.out(out, 3);
+  e.bytes(H, 4);
+  e.bytes(num_groups, 5);
+  e.bytes(group_size, 6);
+  e.bytes(taps, 7);
+  e.bytes(block_size, 8);
+  e.bytes(delta_row_stride, 9);
+  e.bytes(total, 10);
+  e.dispatch((total + 255) / 256, 1, 1, 256, 1, 1);
+}
+
 // Multi-row iq2_xxs MoE GEMV with the fused SwiGLU epilogue: emits the
 // activated (tokens*topk, N/2) tensor directly. NSG=2, NPAIR=2 (2 gate +
 // 2 up rows per simdgroup).
 // Contract: N/2 must be a multiple of kNsg*kNpair (4) — host-checked; tail
 // simdgroups would otherwise walk gate/up rows past N.
 template <class E>
-void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d,
-                                typename E::in_t wq, typename E::in_t x,
-                                typename E::in_t topk_ids, int N, int K,
-                                int tokens, int topk, int has_clamp,
-                                float limit, const std::string& type_name) {
+void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d, typename E::in_t wq,
+                                typename E::in_t x, typename E::in_t topk_ids,
+                                int N, int K, int tokens, int topk,
+                                int has_clamp, float limit,
+                                const std::string& type_name) {
   constexpr int kNsg = 2, kNpair = 2;
   std::string name = "qgemv_iq2_xxs_moe_mr_swiglu";
   if (type_name == "bfloat16") name += "_bfloat16";
@@ -6211,9 +6900,8 @@ void launch_dsv4_router_topk(E& e, typename E::in_t gating,
 // Contract: N must be a multiple of nsg*nr0 (32 for fp16, 8 for bf16) —
 // host-checked, same tail-row rationale as launch_qgemv_moe_mr.
 template <class E>
-void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d,
-                                 typename E::in_t wq, typename E::in_t x,
-                                 typename E::in_t topk_ids,
+void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d, typename E::in_t wq,
+                                 typename E::in_t x, typename E::in_t topk_ids,
                                  typename E::in_t topk_w, int N, int K,
                                  int tokens, int topk,
                                  const std::string& type_name,
@@ -6270,8 +6958,8 @@ void launch_moe_mm_id(E& e, typename E::out_t d, typename E::in_t wq,
                       typename E::in_t x, typename E::in_t tpe,
                       typename E::in_t ids, typename E::in_t work,
                       typename E::in_t wcount, int work_cap, int N, int K,
-                      int tokens, int topk, const std::string& fmt,
-                      bool soa, bool w64) {
+                      int tokens, int topk, const std::string& fmt, bool soa,
+                      bool w64) {
   // iq2_xxs = w13 (X is (tokens, K), B row = id/topk); q2_K = down (X is
   // (tokens*topk, K) per-slot, B row = id). SoA twin reads the resident
   // SoA plane layout; iq2_xxs has no SoA twin.
@@ -6721,6 +7409,98 @@ void launch_tq_attention_combined(
   e.bytes(k_signed, 17);
   e.bytes(v_bits, 18);
   e.bytes(scale, 19);
+  e.dispatch(num_heads, batch, 1, head_size, 1, 1);
+}
+
+// ----- tq_decode_combined: dequant a contiguous slot run from the combined
+//       cache into dense (1, Hkv, n_rows, HS) buffers. slots@1 is (n_rows,)
+//       int32 with -1 = leave row unwritten; grid (n_rows, Hkv, 1),
+//       head_size threads. -----
+template <class E>
+void launch_tq_decode_combined(
+    E& e, typename E::in_t cache, typename E::in_t slots,
+    typename E::in_t v_centroids, typename E::in_t signs,
+    typename E::out_t k_out, typename E::out_t v_out, int n_rows,
+    int num_kv_heads, int head_size, int block_size, int block_stride,
+    int token_stride, int head_stride, int k_bits, int k_signed, int v_bits,
+    const std::string& type_name) {
+  e.pipeline("tq_decode_combined_" + type_name + "_hs" +
+             std::to_string(head_size));
+  e.in(cache, 0);
+  e.in(slots, 1);
+  e.in(v_centroids, 2);
+  e.in(signs, 3);
+  e.out(k_out, 4);
+  e.out(v_out, 5);
+  e.bytes(num_kv_heads, 6);
+  e.bytes(block_size, 7);
+  e.bytes(block_stride, 8);
+  e.bytes(token_stride, 9);
+  e.bytes(head_stride, 10);
+  e.bytes(n_rows, 11);
+  e.bytes(k_bits, 12);
+  e.bytes(k_signed, 13);
+  e.bytes(v_bits, 14);
+  e.dispatch(n_rows, num_kv_heads, 1, head_size, 1, 1);
+}
+
+// ----- tq_attention_splitk / tq_attention_reduce: split-K TQ decode
+//       attention. Partition kernel reads the block table directly (no host
+//       slots matrix), grid (H, B, P), head_size threads; partials land in
+//       tmp (B,H,P,HS) f32 / ml (B,H,P) / es (B,H,P). Reduce merges, applies
+//       the sink, and runs the single inverse FWHT; grid (H, B). -----
+template <class E>
+void launch_tq_attention_splitk(
+    E& e, typename E::in_t q, typename E::in_t cache,
+    typename E::in_t block_table, typename E::in_t lengths,
+    typename E::in_t v_centroids, typename E::out_t tmp, typename E::out_t ml,
+    typename E::out_t es, int batch, int num_heads, int num_kv_heads,
+    int head_size, int bt_stride, int block_size, int block_stride,
+    int token_stride, int head_stride, int num_partitions, int partition_size,
+    int k_bits, int k_signed, int v_bits, float scale,
+    const std::string& type_name) {
+  e.pipeline("tq_attention_splitk_" + type_name + "_hs" +
+             std::to_string(head_size));
+  e.in(q, 0);
+  e.in(cache, 1);
+  e.in(block_table, 2);
+  e.in(lengths, 3);
+  e.in(v_centroids, 4);
+  e.out(tmp, 5);
+  e.out(ml, 6);
+  e.out(es, 7);
+  e.bytes(num_heads, 8);
+  e.bytes(num_kv_heads, 9);
+  e.bytes(bt_stride, 10);
+  e.bytes(block_size, 11);
+  e.bytes(block_stride, 12);
+  e.bytes(token_stride, 13);
+  e.bytes(head_stride, 14);
+  e.bytes(num_partitions, 15);
+  e.bytes(partition_size, 16);
+  e.bytes(k_bits, 17);
+  e.bytes(k_signed, 18);
+  e.bytes(v_bits, 19);
+  e.bytes(scale, 20);
+  e.dispatch(num_heads, batch, num_partitions, head_size, 1, 1);
+}
+
+template <class E>
+void launch_tq_attention_reduce(
+    E& e, typename E::in_t tmp, typename E::in_t ml, typename E::in_t es,
+    typename E::in_t sinks, typename E::in_t signs, typename E::out_t out,
+    int batch, int num_heads, int head_size, int num_partitions,
+    const std::string& type_name) {
+  e.pipeline("tq_attention_reduce_" + type_name + "_hs" +
+             std::to_string(head_size));
+  e.in(tmp, 0);
+  e.in(ml, 1);
+  e.in(es, 2);
+  e.in(sinks, 3);
+  e.in(signs, 4);
+  e.out(out, 5);
+  e.bytes(num_heads, 6);
+  e.bytes(num_partitions, 7);
   e.dispatch(num_heads, batch, 1, head_size, 1, 1);
 }
 

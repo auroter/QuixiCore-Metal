@@ -87,6 +87,7 @@ families:
       - kernels/quantization/lm_head
       - kernels/quantization/dequant_gather
       - kernels/quantization/turboquant
+      - kernels/quantization/qgemm_sm
   vision:
     status: implemented
     paths:
@@ -120,6 +121,9 @@ families:
       - kernels/serving/moe_finalize
       - kernels/serving/rms_norm
       - kernels/serving/swiglu
+      - kernels/serving/dflash_conv
+      - kernels/serving/qk_norm_rope_gate
+      - kernels/serving_glue
   optimizers:
     status: implemented
     paths:

@@ -16,6 +16,10 @@ kernel void kv_cache_zero(device T *key_cache [[buffer(0)]],
     value_cache[tid] = T(0);
 }
 
+// block_mult: 1 for standard contiguous (nb, bs, H, D) caches; 2 for the
+// page-local (nb, 2, bs, H, D) layout, where the caller binds key_cache to
+// the dense base and value_cache to the base shifted by one block (K and V
+// of block b are dense blocks 2b and 2b+1).
 template <typename T>
 kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
                              device const T *value [[buffer(1)]],
@@ -25,6 +29,7 @@ kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
                              constant int &num_heads [[buffer(5)]],
                              constant int &head_size [[buffer(6)]],
                              constant int &block_size [[buffer(7)]],
+                             constant int &block_mult [[buffer(8)]],
                              uint token [[threadgroup_position_in_grid]],
                              uint tid [[thread_position_in_threadgroup]],
                              uint tptg [[threads_per_threadgroup]]) {
@@ -33,7 +38,7 @@ kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
         return;
     }
 
-    const long block = slot / block_size;
+    const long block = (slot / block_size) * block_mult;
     const long block_offset = slot % block_size;
     const int row_elems = num_heads * head_size;
     const long src_base = (long)token * row_elems;
@@ -95,6 +100,56 @@ kernel void kv_cache_gather(device const T *key_cache [[buffer(0)]],
 
     const long cache_base =
         (((long)block * block_size + slot) * num_heads) * head_size;
+    for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+        key_out[out_base + i] = key_cache[cache_base + i];
+        value_out[out_base + i] = value_cache[cache_base + i];
+    }
+}
+
+// Gather one contiguous logical token range from a single request. Unlike
+// kv_cache_gather above, cache_block_stride is explicit: hybrid attention /
+// recurrent models interleave each block's K and V pages in one allocation,
+// so successive K (or V) blocks are separated by two pages. All cache address
+// arithmetic is 64-bit because a large Metal cache can cross 2^31 elements;
+// MPS index_select silently wraps there.
+template <typename T>
+kernel void kv_cache_gather_range(
+    device const T *key_cache [[buffer(0)]],
+    device const T *value_cache [[buffer(1)]],
+    device T *key_out [[buffer(2)]],
+    device T *value_out [[buffer(3)]],
+    device const int *block_table [[buffer(4)]],
+    constant int &token_start [[buffer(5)]],
+    constant int &num_tokens [[buffer(6)]],
+    constant int &num_blocks [[buffer(7)]],
+    constant int &block_size [[buffer(8)]],
+    constant int &num_heads [[buffer(9)]],
+    constant int &head_size [[buffer(10)]],
+    constant long &cache_block_stride [[buffer(11)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    if ((int)token >= num_tokens) {
+        return;
+    }
+
+    const int logical_token = token_start + (int)token;
+    const int table_col = logical_token / block_size;
+    const int block_offset = logical_token - table_col * block_size;
+    const int block = block_table[table_col];
+    const int row_elems = num_heads * head_size;
+    const long out_base = (long)token * row_elems;
+
+    if (block < 0 || block >= num_blocks) {
+        for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+            key_out[out_base + i] = T(0);
+            value_out[out_base + i] = T(0);
+        }
+        return;
+    }
+
+    const long cache_base =
+        (long)block * cache_block_stride + (long)block_offset * row_elems;
     for (int i = (int)tid; i < row_elems; i += (int)tptg) {
         key_out[out_base + i] = key_cache[cache_base + i];
         value_out[out_base + i] = value_cache[cache_base + i];
@@ -268,6 +323,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
                             constant int &use_mask [[buffer(14)]],             // 0 = dense
                             constant int &window [[buffer(15)]],               // >0 = sliding window
                             constant int &mask_heads [[buffer(16)]],           // 1 = per-batch, H = per-head
+                            constant ulong &kv_block_stride [[buffer(17)]],    // cache stride(0), elements
                             uint3 tgid [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -309,8 +365,12 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
             continue;
         }
 
+        // Explicit block stride: the hybrid pool serves blocks-first
+        // strided K/V views (stride(0) = 2x page); for contiguous caches
+        // this equals block_size*num_kv_heads*D — bit-identical address.
         const long cache_base =
-            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+            (long)block * (long)kv_block_stride +
+            ((long)slot * num_kv_heads + kv_head) * D;
         float partial = 0.0f;
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
@@ -1101,6 +1161,7 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
                       constant int &num_heads [[buffer(5)]],                  \
                       constant int &head_size [[buffer(6)]],                  \
                       constant int &block_size [[buffer(7)]],                 \
+                      constant int &block_mult [[buffer(8)]],                 \
                       uint token [[threadgroup_position_in_grid]],            \
                       uint tid [[thread_position_in_threadgroup]],            \
                       uint tptg [[threads_per_threadgroup]]);                 \
@@ -1120,6 +1181,23 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
                      uint token [[threadgroup_position_in_grid]],             \
                      uint tid [[thread_position_in_threadgroup]],             \
                      uint tptg [[threads_per_threadgroup]]);                  \
+  template [[host_name("kv_cache_gather_range_" #type_name)]] [[kernel]] void \
+  kv_cache_gather_range<T>(                                                   \
+      device const T *key_cache [[buffer(0)]],                                \
+      device const T *value_cache [[buffer(1)]],                              \
+      device T *key_out [[buffer(2)]],                                        \
+      device T *value_out [[buffer(3)]],                                      \
+      device const int *block_table [[buffer(4)]],                            \
+      constant int &token_start [[buffer(5)]],                                \
+      constant int &num_tokens [[buffer(6)]],                                 \
+      constant int &num_blocks [[buffer(7)]],                                 \
+      constant int &block_size [[buffer(8)]],                                 \
+      constant int &num_heads [[buffer(9)]],                                  \
+      constant int &head_size [[buffer(10)]],                                 \
+      constant long &cache_block_stride [[buffer(11)]],                       \
+      uint token [[threadgroup_position_in_grid]],                            \
+      uint tid [[thread_position_in_threadgroup]],                            \
+      uint tptg [[threads_per_threadgroup]]);                                 \
   template [[host_name("kv_cache_clone_" #type_name)]] [[kernel]] void       \
   kv_cache_clone<T>(device const T *key_cache [[buffer(0)]],                  \
                     device const T *value_cache [[buffer(1)]],                \
@@ -1165,6 +1243,7 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
       constant int &use_mask [[buffer(14)]],                                 \
       constant int &window [[buffer(15)]],                                   \
       constant int &mask_heads [[buffer(16)]],                               \
+      constant ulong &kv_block_stride [[buffer(17)]],                        \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 
@@ -1211,10 +1290,16 @@ instantiate_kv_cache_type(bfloat16, bf16)
 
 instantiate_paged_attention_type(float32, float, 64)
 instantiate_paged_attention_type(float32, float, 128)
+// D=256: Qwen3.8 full-attn head size (VALUES_PER_LANE = 8; register-fine —
+// the MLA reduce in this library runs D=512). Without these, head-256
+// models silently decode through the per-request SDPA gather fallback.
+instantiate_paged_attention_type(float32, float, 256)
 instantiate_paged_attention_type(float16, half, 64)
 instantiate_paged_attention_type(float16, half, 128)
+instantiate_paged_attention_type(float16, half, 256)
 instantiate_paged_attention_type(bfloat16, bf16, 64)
 instantiate_paged_attention_type(bfloat16, bf16, 128)
+instantiate_paged_attention_type(bfloat16, bf16, 256)
 
 instantiate_paged_attention_staged(float32, float, 64)
 instantiate_paged_attention_staged(float32, float, 128)

@@ -3752,3 +3752,43 @@ passed.
   (xcrun metal 3.1, all families); bindings/pytorch_mps/tk_torch/
   torch_kernels.mm passes -fsyntax-only against the updated tk_launch.h.
   In-repo benchmark wiring for the new kernels is follow-up work.
+
+## 2026-08-25 - Qwen3.8-27B NVFP4 M1 Ultra serving-campaign port from SlimServe
+
+- Status: retained (port of measured, gated work)
+- Scope: the NVFP4-on-Metal serving campaign for unsloth/Qwen3.8-27B-NVFP4
+  developed and measured in the SlimServe tree (QuixiAI/SlimServe PR #12),
+  including the parallel M5 Max GGUF campaign's kernels merged there, ported
+  per the vendoring contract. Apple M1 Ultra, macOS 15.7.2.
+- New kernels: kernels/quantization/qgemm_sm (small-M weight-streaming
+  tensor-ops GEMMs, __HAVE_TENSOR__-guarded for metal3.1),
+  kernels/serving/dflash_conv (DFlash2 grouped-conv drafter fusion),
+  kernels/serving/qk_norm_rope_gate (fused per-head QK RMSNorm + rope +
+  gate split), kernels/serving_glue (muse_step single-command-buffer
+  target forward, gdn_step fused decode/verify, dflash2_conv,
+  dflash_prepare, rejection_sample).
+- Extended: qgemv.metal (qgemv_fp8ch / qgemv_nvfp4_planar + batch _mb
+  twins, v6/v7 vectorized decode), turboquant.metal (tq_decode_combined,
+  tq_attention_splitk/reduce, k8v4 KV path), gdn.metal (spec verify +
+  num_accepted OOB guard), paged_attn_v2.metal (head-256 split-K,
+  kv_block_stride-aware addressing), kv_cache.metal (block_mult layouts,
+  64-bit gather_range), rms_norm.metal (gemma-norm variants),
+  qgemm.metal, indexer.metal, dequant/dequant_tables substrate
+  (iq2_s/iq3_s/iq1_m descriptors), and tk_launch.h (launch ABI for all
+  of the above: paged attention kv_block_stride, scatter block_mult,
+  gdn_recur/short_conv explicit state strides). Kernel manifest updated;
+  design note ported to docs/muse-qwen38-design.md.
+- Measured results (SlimServe serving stack on this box, exact-token
+  harness): canonical decode c1 17.26 tok/s (154% of the Q4_K bar, at
+  the modeled bandwidth ceiling), c4 23.1 / c8 25.6, pure decode ~30
+  tok/s, prefill ~150 tok/s vs llama.cpp 21.0 decode on the same box.
+  Correctness: bit-exact serving anchors (sha256 chain, 26 consecutive
+  DSV4 anchor re-gates), 30k needle exact; method and raw artifacts in
+  SlimServe perf/optimization_status.md UPDATEs 5-55.
+- Port validation here: full metallib compiles from this tree's kernel
+  set (xcrun metal 3.1, all families, 15.4 MB);
+  bindings/pytorch_mps/tk_torch/torch_kernels.mm updated to the new
+  launch ABI (paged kv_block_stride = contiguous cache stride(0),
+  scatter block_mult=1, gdn state strides from the contiguous pools)
+  and passes -fsyntax-only. In-repo benchmark wiring for the new
+  kernels is follow-up work.
