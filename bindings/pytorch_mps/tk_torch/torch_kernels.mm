@@ -2254,7 +2254,7 @@ static at::Tensor paged_attention_v2_mps(
         e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
         B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
         num_partitions, static_cast<int>(partition_size), static_cast<int>(window),
-        static_cast<float>(softcap), tn);
+        static_cast<float>(softcap), static_cast<uint64_t>(key_cache.stride(0)), tn);
     tk::launch_paged_attention_reduce(
         e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, sinks,
         has_sink ? 1 : 0, tn);
@@ -2303,7 +2303,7 @@ static at::Tensor cascade_attention_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_cascade_prefix_partition(e, q, prefix_k, prefix_v, p_tmp, p_ml, p_es, B, H, H_KV, D,
                                         prefix_len, scale_f, Pp, ps, tn);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, static_cast<uint64_t>(key_cache.stride(0)), tn);
   });
   auto tmp = at::cat({p_tmp, s_tmp}, 2);
   auto ml = at::cat({p_ml, s_ml}, 2);
@@ -2354,7 +2354,7 @@ static at::Tensor cascade_attention_multi_mps(
     }
     auto s_tmp = at::empty({B, H, Ps, D}, f32), s_ml = at::empty({B, H, Ps}, f32),
          s_es = at::empty({B, H, Ps}, f32);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, static_cast<uint64_t>(key_cache.stride(0)), tn);
     tmps.push_back(s_tmp); mls.push_back(s_ml); ess.push_back(s_es);
     total_parts += Ps;
   });
@@ -2402,7 +2402,7 @@ static at::Tensor cascade_attention_fp8_mps(
     tk::launch_cascade_prefix_partition_fp8(e, q, pk, pv, p_tmp, p_ml, p_es, B, H, H_KV, D,
                                             prefix_len, scale_f, Pp, ps, ks, vs,
                                             static_cast<int>(fmt), tn);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, bt, cl, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(bt.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, bt, cl, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(bt.size(1)), scale_f, Ps, ps, 0, 0.0f, static_cast<uint64_t>(key_cache.stride(0)), tn);
   });
   auto tmp = at::cat({p_tmp, s_tmp}, 2), ml = at::cat({p_ml, s_ml}, 2), es = at::cat({p_es, s_es}, 2);
   auto out = at::empty_like(q);
