@@ -3767,7 +3767,7 @@ passed.
   gate split), kernels/serving_glue (muse_step single-command-buffer
   target forward, gdn_step fused decode/verify, dflash2_conv,
   dflash_prepare, rejection_sample).
-- Extended: qgemv.metal (qgemv_fp8ch / qgemv_nvfp4_planar + batch _mb
+- Extended: `qgemv.metal` (`qgemv_fp8ch` / `qgemv_nvfp4_planar` + batch `_mb`
   twins, v6/v7 vectorized decode), turboquant.metal (tq_decode_combined,
   tq_attention_splitk/reduce, k8v4 KV path), gdn.metal (spec verify +
   num_accepted OOB guard), paged_attn_v2.metal (head-256 split-K,

@@ -154,7 +154,18 @@ ssm_state; single encoder preserves program order within the CB).
 ## As-built deltas (what shipped vs the plan above)
 
 The Why / Numerics stance / Phases sections above are accurate as written.
-The two surface sections drifted during bring-up; the shipped ABI is:
+The two surface sections drifted during bring-up; the shipped ABI is
+described below.
+
+Where it lives: the `muse_q38_*` host ABI is SlimServe's Torch/MPS binding
+(`csrc/quixicore/tm_metal/qc_metal_serving.mm`, Python surface
+`vllm/quixicore/ops.py`, wired in from `Qwen3NextModel.forward`), which is
+not part of this repository. What this repository ships is the kernel side
+that binding drives: `kernels/serving_glue/` (muse_step, gdn_step,
+dflash2_conv, dflash_prepare, rejection_sample), the quantized GEMV/GEMM
+families under `kernels/quantization/`, and the paged/verify attention under
+`kernels/attention/`. The ABI is recorded here so the kernel contracts can be
+read against their only caller.
 
 - There is no `muse_q38_layer_common`: MLP weights and norm seams are
   registered through `muse_q38_layer_gdn` / `muse_q38_layer_attn` directly
